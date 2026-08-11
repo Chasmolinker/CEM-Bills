@@ -884,12 +884,24 @@ export default function Ledger() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [pendingImport, setPendingImport] = useState(null);
   const [backupImportError, setBackupImportError] = useState(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [clearThroughDate, setClearThroughDate] = useState(() => toISODate(new Date()));
+  const [clearFromDate, setClearFromDate] = useState(() => `${new Date().getFullYear()}-01-01`);
+  const [githubConfig, setGithubConfig] = useState(null);
+  const [githubConfigDraft, setGithubConfigDraft] = useState(null);
+  const [githubPushStatus, setGithubPushStatus] = useState("idle");
+  const [githubPushMessage, setGithubPushMessage] = useState(null);
+
+  useEffect(() => {
+    if (githubConfig && !githubConfigDraft) setGithubConfigDraft(githubConfig);
+  }, [githubConfig]);
   const [trendsStart, setTrendsStart] = useState(`${new Date().getFullYear()}-01-01`);
   const [trendsEnd, setTrendsEnd] = useState(toISODate(new Date()));
   const [range, setRange] = useState("month");
   const [upcomingStatusFilter, setUpcomingStatusFilter] = useState("all");
-  const [balancePeriod, setBalancePeriod] = useState("month");
+  const [balancePeriod] = useState("year");
   const [ledgerPeriod, setLedgerPeriod] = useState("week");
+  const [ledgerReferenceDate, setLedgerReferenceDate] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [editAccount, setEditAccount] = useState(null);
   const [editRecurring, setEditRecurring] = useState(null);
@@ -937,6 +949,12 @@ export default function Ledger() {
         setDebts(res4 ? JSON.parse(res4.value) : DEFAULT_DEBTS);
       } catch {
         setDebts(DEFAULT_DEBTS);
+      }
+      try {
+        const res5 = await window.storage.get("github_backup_config");
+        setGithubConfig(res5 ? JSON.parse(res5.value) : { owner: "", repo: "", branch: "main", token: "" });
+      } catch {
+        setGithubConfig({ owner: "", repo: "", branch: "main", token: "" });
       }
     })();
   }, []);
@@ -1000,16 +1018,18 @@ export default function Ledger() {
     }
   };
 
+  const buildBackupPayload = () => ({
+    app: "money-ledger",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    transactions: items,
+    accounts,
+    recurring,
+    debts,
+  });
+
   const exportBackup = () => {
-    const payload = {
-      app: "money-ledger",
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      transactions: items,
-      accounts,
-      recurring,
-      debts,
-    };
+    const payload = buildBackupPayload();
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1020,6 +1040,87 @@ export default function Ledger() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const saveGithubConfig = async () => {
+    setGithubConfig(githubConfigDraft);
+    try {
+      await window.storage.set("github_backup_config", JSON.stringify(githubConfigDraft));
+    } catch {
+      setError("Couldn't save your GitHub connection settings.");
+    }
+  };
+
+  const disconnectGithub = async () => {
+    const cleared = { owner: "", repo: "", branch: "main", token: "" };
+    setGithubConfig(cleared);
+    setGithubConfigDraft(cleared);
+    setGithubPushStatus("idle");
+    setGithubPushMessage(null);
+    try {
+      await window.storage.set("github_backup_config", JSON.stringify(cleared));
+    } catch {}
+  };
+
+  const utf8ToBase64 = (str) => {
+    const bytes = new TextEncoder().encode(str);
+    let binary = "";
+    bytes.forEach((b) => (binary += String.fromCharCode(b)));
+    return btoa(binary);
+  };
+
+  const pushBackupToGithub = async () => {
+    if (!githubConfig || !githubConfig.owner || !githubConfig.repo || !githubConfig.token) {
+      setGithubPushStatus("error");
+      setGithubPushMessage("Fill in and save your repo owner, repo name, and token first.");
+      return;
+    }
+    setGithubPushStatus("pushing");
+    setGithubPushMessage(null);
+
+    const { owner, repo, branch, token } = githubConfig;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const path = `backups/money-ledger-backup-${stamp}.json`;
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+    const payload = buildBackupPayload();
+    const content = utf8ToBase64(JSON.stringify(payload, null, 2));
+
+    try {
+      const res = await fetch(apiUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: `token ${token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: `Money Ledger backup — ${new Date().toLocaleString()}`,
+          content,
+          branch: branch || "main",
+        }),
+      });
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        const reason = (data && data.message) || `HTTP ${res.status}`;
+        setGithubPushStatus("error");
+        setGithubPushMessage(
+          res.status === 401
+            ? "GitHub rejected the token. Check that it's still valid and has Contents write access."
+            : res.status === 404
+            ? "Repo not found — check the owner/repo spelling, or make sure the token can see this repo."
+            : `GitHub error: ${reason}`
+        );
+        return;
+      }
+
+      setGithubPushStatus("success");
+      setGithubPushMessage(`Pushed to ${owner}/${repo} at ${path}.`);
+    } catch (e) {
+      setGithubPushStatus("error");
+      setGithubPushMessage("Couldn't reach GitHub. Check your connection and try again.");
+    }
   };
 
   const importBackup = (file) => {
@@ -1051,6 +1152,16 @@ export default function Ledger() {
     setRedoStack([]);
     setPendingImport(null);
   };
+
+  const clearLedger = () => {
+    mutateItems(items.filter((t) => !(t.date >= clearFromDate && t.date <= clearThroughDate)));
+    setShowClearConfirm(false);
+  };
+
+  const clearLedgerPreviewCount = useMemo(() => {
+    if (!items) return 0;
+    return items.filter((t) => t.date >= clearFromDate && t.date <= clearThroughDate).length;
+  }, [items, clearFromDate, clearThroughDate]);
 
   const accountBalances = useMemo(() => {
     if (!items || !accounts) return {};
@@ -1148,11 +1259,205 @@ export default function Ledger() {
     return days;
   }, [items, accounts, periodBalances]);
 
-  const todayChartLabel = useMemo(() => {
+  // For Quarter/Year, daily points create a lot of visual bulk, so downsample to one
+  // point per week (Quarter) or per month (Year). Normally that's each bucket's last
+  // value, since a balance is a point-in-time snapshot — but if any day in the bucket
+  // dipped negative for a given account, that account's bucket keeps its worst day
+  // instead, so a mid-month overdraft that recovered by month-end doesn't just vanish.
+  const chartDisplayDataByAccount = useMemo(() => {
+    const result = {};
+    accounts.forEach((a) => {
+      if ((balancePeriod !== "quarter" && balancePeriod !== "year") || rollingBalanceData.length === 0) {
+        result[a.id] = rollingBalanceData;
+        return;
+      }
+      const bucketSize = balancePeriod === "quarter" ? 7 : 30;
+      const buckets = [];
+      for (let i = 0; i < rollingBalanceData.length; i += bucketSize) {
+        const slice = rollingBalanceData.slice(i, i + bucketSize);
+        const negativeDays = slice.filter((d) => d[a.id] < 0);
+        if (negativeDays.length > 0) {
+          buckets.push(negativeDays.reduce((worst, d) => (d[a.id] < worst[a.id] ? d : worst), negativeDays[0]));
+        } else {
+          buckets.push(slice[slice.length - 1]);
+        }
+      }
+      // Always keep the very last day so the chart's right edge matches the true period end.
+      const last = rollingBalanceData[rollingBalanceData.length - 1];
+      if (buckets[buckets.length - 1] !== last) buckets.push(last);
+      result[a.id] = buckets;
+    });
+    return result;
+  }, [rollingBalanceData, balancePeriod, accounts]);
+
+  // Slider is a continuous 0-100 value mapped on a log scale to a 7-365 day window,
+  // so Week/Month/Quarter/Year sit at meaningful, evenly-spaced snap positions rather
+  // than clustering at one end of the track.
+  const ZOOM_MIN_DAYS = 7;
+  const ZOOM_MAX_DAYS = 365;
+  const zoomValueToDays = (v) => Math.round(Math.exp(Math.log(ZOOM_MIN_DAYS) + (v / 100) * (Math.log(ZOOM_MAX_DAYS) - Math.log(ZOOM_MIN_DAYS))));
+  const zoomDaysToValue = (d) => ((Math.log(d) - Math.log(ZOOM_MIN_DAYS)) / (Math.log(ZOOM_MAX_DAYS) - Math.log(ZOOM_MIN_DAYS))) * 100;
+
+  const ZOOM_SNAP_POINTS = [
+    { key: "week", label: "Week", days: 7 },
+    { key: "month", label: "Month", days: 30 },
+    { key: "quarter", label: "Quarter", days: 90 },
+    { key: "year", label: "Year", days: 365 },
+  ].map((s) => ({ ...s, value: zoomDaysToValue(s.days) }));
+  const ZOOM_SNAP_THRESHOLD = 3;
+
+  const [chartZoomValue, setChartZoomValue] = useState(100);
+  const [zoomSnapNote, setZoomSnapNote] = useState(null);
+  const [zoomSnapFading, setZoomSnapFading] = useState(false);
+  const zoomNoteTimers = useRef([]);
+
+  const showZoomSnapNote = (label) => {
+    zoomNoteTimers.current.forEach((t) => clearTimeout(t));
+    zoomNoteTimers.current = [];
+    setZoomSnapNote(label);
+    setZoomSnapFading(false);
+    zoomNoteTimers.current.push(setTimeout(() => setZoomSnapFading(true), 900));
+    zoomNoteTimers.current.push(setTimeout(() => setZoomSnapNote(null), 1250));
+  };
+
+  const applyZoomValue = (rawValue) => {
+    const snap = ZOOM_SNAP_POINTS.find((s) => Math.abs(s.value - rawValue) <= ZOOM_SNAP_THRESHOLD);
+    if (snap) {
+      setChartZoomValue(snap.value);
+      showZoomSnapNote(snap.label);
+    } else {
+      setChartZoomValue(rawValue);
+    }
+  };
+
+  const todayRawIndex = useMemo(() => {
     const todayStr = toISODate(new Date());
-    const found = rollingBalanceData.find((d) => d.date === todayStr);
-    return found ? found.label : null;
+    const idx = rollingBalanceData.findIndex((d) => d.date >= todayStr);
+    return idx === -1 ? rollingBalanceData.length - 1 : idx;
   }, [rollingBalanceData]);
+
+  const getZoomedChartData = (accountId) => {
+    const windowDays = zoomValueToDays(chartZoomValue);
+    const displayData = chartDisplayDataByAccount[accountId] || rollingBalanceData;
+    if (windowDays >= rollingBalanceData.length) return displayData;
+    // Zoomed views always use the raw daily series, even if the full view is downsampled,
+    // so zooming in restores full day-by-day detail rather than staying at the coarser scale.
+    const half = Math.floor(windowDays / 2);
+    let start = Math.max(0, todayRawIndex - half);
+    let end = Math.min(rollingBalanceData.length, start + windowDays);
+    start = Math.max(0, end - windowDays);
+    return rollingBalanceData.slice(start, end);
+  };
+
+  // Derived from whichever dataset is actually being rendered for that account, not a
+  // shared coarser series — otherwise the label string it produces (e.g. from a downsampled
+  // monthly bucket) won't match any point in a zoomed-in raw-daily view, and the reference
+  // line silently fails to render at all.
+  const getTodayChartLabel = (accountId) => {
+    const data = getZoomedChartData(accountId);
+    if (data.length === 0) return null;
+    const todayStr = toISODate(new Date());
+    const entry = data.find((d) => d.date >= todayStr) || data[data.length - 1];
+    return entry ? entry.label : null;
+  };
+
+  const handleChartWheelZoom = (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -4 : 4;
+    applyZoomValue(Math.min(100, Math.max(0, chartZoomValue + delta)));
+  };
+
+  const [chartDrillTarget, setChartDrillTarget] = useState(null);
+  const chartPressTimer = useRef(null);
+
+  const goToTransactionInLedger = (t) => {
+    const targetAccountId = t.type === "transfer" ? t.fromAccountId : t.accountId;
+    setLedgerAccountFilter(targetAccountId || "all");
+    setLedgerReferenceDate(t.date);
+    setLedgerPeriod("month");
+    setChartDrillTarget(null);
+    setView("ledger");
+  };
+
+  const openChartDrill = (accountId, payload) => {
+    const date = payload.date;
+    const forAccount = (t) => {
+      if (t.type === "transfer") return t.fromAccountId === accountId || t.toAccountId === accountId;
+      return t.accountId === accountId;
+    };
+    const matches = items.filter((t) => t.date === date && forAccount(t));
+
+    let nearest = null;
+    if (matches.length === 0) {
+      // The balance carried over unchanged, so find whichever real transaction actually
+      // set it — the most recent one on or before this date, or if the account has no
+      // history yet at this point, the very next one after it.
+      const accountItems = items.filter(forAccount).sort(byDateAsc);
+      const before = [...accountItems].filter((t) => t.date <= date).sort(byDateDesc)[0];
+      const after = accountItems.find((t) => t.date > date);
+      nearest = before || after || null;
+    }
+
+    setChartDrillTarget({ date, accountId, matches, nearest });
+  };
+
+  const startChartDotPress = (accountId, payload) => {
+    if (chartPressTimer.current) clearTimeout(chartPressTimer.current);
+    chartPressTimer.current = setTimeout(() => {
+      openChartDrill(accountId, payload);
+      chartPressTimer.current = null;
+    }, 550);
+  };
+
+  const cancelChartDotPress = () => {
+    if (chartPressTimer.current) {
+      clearTimeout(chartPressTimer.current);
+      chartPressTimer.current = null;
+    }
+  };
+
+  const renderChartTooltip = (accountId) => {
+    const ChartTooltip = ({ active, payload, label }) => {
+      if (!active || !payload || !payload.length) return null;
+      const point = payload[0].payload;
+      const value = point[accountId];
+      return (
+        <div
+          onTouchStart={(e) => {
+            e.preventDefault();
+            startChartDotPress(accountId, point);
+          }}
+          onTouchEnd={cancelChartDotPress}
+          onTouchMove={cancelChartDotPress}
+          onTouchCancel={cancelChartDotPress}
+          onMouseDown={() => startChartDotPress(accountId, point)}
+          onMouseUp={cancelChartDotPress}
+          onMouseLeave={cancelChartDotPress}
+          onContextMenu={(e) => e.preventDefault()}
+          style={{
+            fontSize: 11,
+            border: `1px solid ${LINE}`,
+            borderRadius: 6,
+            background: SURFACE,
+            color: TEXT,
+            padding: "0.4rem 0.55rem",
+            cursor: "pointer",
+            userSelect: "none",
+            WebkitUserSelect: "none",
+            WebkitTouchCallout: "none",
+            touchAction: "none",
+          }}
+        >
+          <div style={{ color: TEXT, marginBottom: 2 }}>{label}</div>
+          <div style={{ color: accountColorFor(accountId, accounts) }}>
+            {accountName(accountId)} : {fmt(value)}
+          </div>
+          <div style={{ color: MUTED, fontSize: 9.5, marginTop: 3 }}>Hold to see the transaction</div>
+        </div>
+      );
+    };
+    return <ChartTooltip />;
+  };
 
   const completedBalanceByItemId = useMemo(() => {
     if (!items || !accounts) return {};
@@ -1467,7 +1772,8 @@ export default function Ledger() {
   const ledgerPeriodItems = useMemo(() => {
     if (!items) return { items: [], start: new Date(), end: new Date(), todayIndex: 0, label: "" };
     const today = new Date();
-    const [start, end] = periodBounds(ledgerPeriod, today);
+    const windowAnchor = ledgerReferenceDate ? new Date(ledgerReferenceDate) : today;
+    const [start, end] = periodBounds(ledgerPeriod, windowAnchor);
     const startStr = toISODate(start);
     const endStr = toISODate(end);
     const filtered = items.filter((t) => t.date >= startStr && t.date <= endStr && matchesAccountFilter(t, ledgerAccountFilter)).sort(byDateAsc);
@@ -1480,7 +1786,7 @@ export default function Ledger() {
       todayIndex: todayIdx === -1 ? filtered.length : todayIdx,
       label: periodLabel(ledgerPeriod, start, end),
     };
-  }, [items, ledgerPeriod, ledgerAccountFilter]);
+  }, [items, ledgerPeriod, ledgerAccountFilter, ledgerReferenceDate]);
 
   const chartData = [
     { name: "Income", value: totals.income, key: "income" },
@@ -1951,14 +2257,20 @@ export default function Ledger() {
                 <EmptyNote>No activity logged in this period yet.</EmptyNote>
               ) : (
                 <div style={{ display: "flex", gap: 6 }}>
-                  <div style={{ flex: 1, minWidth: 0, background: SURFACE, border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.6rem 0.4rem 0.4rem 0.5rem" }}>
+                  <div
+                    onWheel={handleChartWheelZoom}
+                    style={{ flex: 1, minWidth: 0, background: SURFACE, border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.6rem 0.4rem 0.4rem 0.5rem" }}
+                  >
                     {accounts.map((a, idx) => {
                       const isLast = idx === accounts.length - 1;
+                      const accountChartData = getZoomedChartData(a.id);
+                      const accountTodayLabel = getTodayChartLabel(a.id);
+                      const lineWidth = accountChartData.length > 180 ? 1.1 : accountChartData.length > 60 ? 1.4 : 1.75;
                       return (
                         <div key={a.id} style={{ marginBottom: isLast ? 0 : 2, borderLeft: `2px solid ${accountColorFor(a.id, accounts)}`, paddingLeft: 6 }}>
                           <div style={{ height: 68 }}>
                             <ResponsiveContainer width="100%" height="100%">
-                              <LineChart data={rollingBalanceData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                              <LineChart data={accountChartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
                                 <CartesianGrid stroke={LINE} strokeDasharray="2 4" vertical horizontal strokeOpacity={0.5} />
                                 <XAxis
                                   dataKey="label"
@@ -1966,20 +2278,21 @@ export default function Ledger() {
                                   axisLine={false}
                                   tickLine={false}
                                   height={isLast ? 16 : 1}
-                                  interval={rollingBalanceData.length > 8 ? Math.ceil(rollingBalanceData.length / 8) - 1 : 0}
+                                  interval={accountChartData.length > 8 ? Math.ceil(accountChartData.length / 8) - 1 : 0}
                                 />
-                                <YAxis tick={{ fontSize: 7.5, fill: MUTED }} axisLine={false} tickLine={false} width={30} tickFormatter={(v) => fmt(v)} tickCount={3} />
+                                <YAxis tick={{ fontSize: 7.5, fill: MUTED }} axisLine={false} tickLine={false} width={30} tickFormatter={(v) => fmt(v)} tickCount={3} domain={["auto", "auto"]} />
                                 <ReferenceLine y={0} stroke={DEBIT} strokeDasharray="3 3" />
-                                {todayChartLabel && <ReferenceLine x={todayChartLabel} stroke={GOLD} strokeWidth={1.5} label={isLast ? { value: "Today", position: "insideTopRight", fill: GOLD, fontSize: 9, fontWeight: 700 } : undefined} />}
-                                <Tooltip formatter={(v) => [fmt(v), a.name]} labelFormatter={(label) => label} contentStyle={{ fontSize: 11, border: `1px solid ${LINE}`, borderRadius: 6, background: SURFACE, color: TEXT }} labelStyle={{ color: TEXT }} />
+                                {accountTodayLabel && <ReferenceLine x={accountTodayLabel} stroke={GOLD} strokeWidth={1.5} label={isLast ? { value: "Today", position: "insideTopRight", fill: GOLD, fontSize: 9, fontWeight: 700 } : undefined} />}
+                                <Tooltip content={renderChartTooltip(a.id)} wrapperStyle={{ pointerEvents: "auto" }} />
                                 <Line
                                   dataKey={a.id}
                                   name={a.name}
                                   stroke={accountColorFor(a.id, accounts)}
-                                  strokeWidth={1.75}
+                                  strokeWidth={lineWidth}
                                   dot={(props) => {
                                     const neg = props.payload[a.id] < 0;
-                                    return neg ? <circle key={`d-${a.id}-${props.index}`} cx={props.cx} cy={props.cy} r={2.5} fill={DEBIT} stroke="none" /> : <circle key={`d-${a.id}-${props.index}`} r={0} />;
+                                    const key = `d-${a.id}-${props.index}`;
+                                    return neg ? <circle key={key} cx={props.cx} cy={props.cy} r={2.5} fill={DEBIT} stroke="none" /> : <circle key={key} r={0} />;
                                   }}
                                   isAnimationActive={false}
                                 />
@@ -1989,32 +2302,63 @@ export default function Ledger() {
                         </div>
                       );
                     })}
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6, width: 34, flexShrink: 0, alignItems: "center" }}>
-                    {Object.entries(CALENDAR_PERIODS).map(([key, label]) => (
-                      <button
-                        key={key}
-                        onClick={() => setBalancePeriod(key)}
-                        aria-label={label}
-                        style={{
-                          width: 30,
-                          height: 30,
-                          borderRadius: "50%",
-                          border: `1px solid ${balancePeriod === key ? GOLD : LINE}`,
-                          background: balancePeriod === key ? GOLD : SURFACE,
-                          color: balancePeriod === key ? "#0B120E" : MUTED,
-                          fontSize: 11.5,
-                          fontWeight: 700,
-                          cursor: "pointer",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          padding: 0,
-                        }}
-                      >
-                        {label[0]}
-                      </button>
-                    ))}
+                    <div style={{ position: "relative", marginTop: 8, paddingTop: 8, borderTop: `1px dashed ${LINE}` }}>
+                      {zoomSnapNote && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            top: -22,
+                            left: "50%",
+                            transform: "translateX(-50%)",
+                            background: SURFACE_2,
+                            border: `1px solid ${GOLD}`,
+                            borderRadius: 999,
+                            padding: "0.15rem 0.6rem",
+                            fontSize: 10.5,
+                            fontWeight: 700,
+                            color: GOLD,
+                            whiteSpace: "nowrap",
+                            opacity: zoomSnapFading ? 0 : 1,
+                            transition: "opacity 350ms ease",
+                            pointerEvents: "none",
+                          }}
+                        >
+                          {zoomSnapNote}
+                        </div>
+                      )}
+                      <div style={{ position: "relative", height: 18, display: "flex", alignItems: "center" }}>
+                        {ZOOM_SNAP_POINTS.map((s) => (
+                          <div key={s.key} style={{ position: "absolute", left: `${s.value}%`, top: 3, width: 2, height: 8, background: LINE, borderRadius: 1, transform: "translateX(-1px)", pointerEvents: "none" }} />
+                        ))}
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={0.5}
+                          value={chartZoomValue}
+                          onChange={(e) => applyZoomValue(Number(e.target.value))}
+                          style={{ width: "100%", accentColor: GOLD, position: "relative", zIndex: 1 }}
+                          aria-label="Zoom both charts"
+                        />
+                      </div>
+                      <div style={{ position: "relative", height: 12, marginTop: 2 }}>
+                        {ZOOM_SNAP_POINTS.map((s) => (
+                          <span
+                            key={s.key}
+                            style={{
+                              position: "absolute",
+                              left: `${s.value}%`,
+                              transform: s.value <= 2 ? "none" : s.value >= 98 ? "translateX(-100%)" : "translateX(-50%)",
+                              fontSize: 9,
+                              color: MUTED,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {s.label}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
@@ -2266,6 +2610,18 @@ export default function Ledger() {
               ))}
             </div>
             <div style={{ fontSize: 11.5, color: MUTED, marginTop: 8 }}>{ledgerPeriodItems.label}</div>
+
+            {ledgerReferenceDate && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: `${GOLD}18`, border: `1px solid ${GOLD}`, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>
+                <span style={{ fontSize: 11.5, color: GOLD, fontWeight: 600 }}>Viewing around {fmtDate(ledgerReferenceDate)}</span>
+                <button
+                  onClick={() => setLedgerReferenceDate(null)}
+                  style={{ background: "none", border: `1px solid ${GOLD}`, borderRadius: 999, padding: "0.2rem 0.6rem", color: GOLD, fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                >
+                  Back to today
+                </button>
+              </div>
+            )}
 
             <div style={{ position: "relative", height: 34, marginTop: 8, marginBottom: 4 }}>
               <div style={{ position: "absolute", top: 7, left: 0, right: 0, height: 2, background: LINE, borderRadius: 1 }} />
@@ -2636,6 +2992,140 @@ export default function Ledger() {
                 />
               </label>
               {backupImportError && <div style={{ fontSize: 12, color: DEBIT, marginTop: 10 }}>{backupImportError}</div>}
+            </div>
+
+            <div style={{ background: SURFACE, border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.9rem", marginTop: 12 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: TEXT, marginBottom: 4 }}>Push backup to GitHub</div>
+              <div style={{ fontSize: 12, color: MUTED, marginBottom: 12 }}>
+                Sends a timestamped backup straight to a <code>backups/</code> folder in your repo, so it's saved
+                somewhere besides this device without you having to download and re-upload a file every time.
+              </div>
+
+              {githubConfigDraft && (
+                <>
+                  <label style={labelStyle}>Repo owner</label>
+                  <input
+                    value={githubConfigDraft.owner}
+                    onChange={(e) => setGithubConfigDraft({ ...githubConfigDraft, owner: e.target.value.trim() })}
+                    placeholder="e.g. Chasmolinker"
+                    style={inputStyle}
+                  />
+                  <label style={labelStyle}>Repo name</label>
+                  <input
+                    value={githubConfigDraft.repo}
+                    onChange={(e) => setGithubConfigDraft({ ...githubConfigDraft, repo: e.target.value.trim() })}
+                    placeholder="e.g. CEM-Bills"
+                    style={inputStyle}
+                  />
+                  <label style={labelStyle}>Branch</label>
+                  <input
+                    value={githubConfigDraft.branch}
+                    onChange={(e) => setGithubConfigDraft({ ...githubConfigDraft, branch: e.target.value.trim() })}
+                    placeholder="main"
+                    style={inputStyle}
+                  />
+                  <label style={labelStyle}>Personal access token</label>
+                  <input
+                    type="password"
+                    value={githubConfigDraft.token}
+                    onChange={(e) => setGithubConfigDraft({ ...githubConfigDraft, token: e.target.value.trim() })}
+                    placeholder="ghp_… or github_pat_…"
+                    style={inputStyle}
+                  />
+                  <div style={{ fontSize: 11, color: MUTED, marginTop: 6, marginBottom: 12 }}>
+                    Use a fine-grained token scoped to only this repo, with just "Contents: Read and write"
+                    permission — not a classic token with full account access. The token is stored only on this
+                    device and is never included in your downloaded backup files.
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    <button
+                      onClick={saveGithubConfig}
+                      style={{ flex: 1, background: "none", border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.55rem 0.7rem", color: TEXT, fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      Save connection
+                    </button>
+                    {(githubConfig.owner || githubConfig.repo || githubConfig.token) && (
+                      <button
+                        onClick={disconnectGithub}
+                        style={{ background: "none", border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.55rem 0.7rem", color: DEBIT, fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+                      >
+                        Disconnect
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={pushBackupToGithub}
+                    disabled={githubPushStatus === "pushing" || !githubConfig.owner || !githubConfig.repo || !githubConfig.token}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: ACCENT,
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "0.6rem 0.9rem",
+                      color: "#fff",
+                      fontSize: 13.5,
+                      fontWeight: 700,
+                      cursor: githubPushStatus === "pushing" ? "default" : "pointer",
+                      opacity: !githubConfig.owner || !githubConfig.repo || !githubConfig.token ? 0.5 : 1,
+                    }}
+                  >
+                    <Archive size={14} />
+                    {githubPushStatus === "pushing" ? "Pushing…" : "Push backup now"}
+                  </button>
+
+                  {githubPushMessage && (
+                    <div style={{ fontSize: 12, color: githubPushStatus === "success" ? CREDIT : DEBIT, marginTop: 10 }}>{githubPushMessage}</div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div style={{ background: SURFACE, border: `1px solid ${DEBIT}`, borderRadius: 8, padding: "0.9rem", marginTop: 12 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: TEXT, marginBottom: 4 }}>Clear ledger</div>
+              <div style={{ fontSize: 12, color: MUTED, marginBottom: 12 }}>
+                Deletes every transaction between the two dates below — useful for wiping out a messy import
+                without touching anything outside that range. Accounts, recurring templates, and debts are left
+                alone. Export a backup first if there's anything worth keeping.
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>From</label>
+                  <input type="date" value={clearFromDate} onChange={(e) => setClearFromDate(e.target.value)} style={dateInputStyle} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>Through</label>
+                  <input type="date" value={clearThroughDate} onChange={(e) => setClearThroughDate(e.target.value)} style={dateInputStyle} />
+                </div>
+              </div>
+              <button
+                onClick={() => setShowClearConfirm(true)}
+                disabled={clearLedgerPreviewCount === 0}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: "none",
+                  border: `1px solid ${clearLedgerPreviewCount === 0 ? LINE : DEBIT}`,
+                  borderRadius: 8,
+                  padding: "0.6rem 0.9rem",
+                  color: clearLedgerPreviewCount === 0 ? MUTED : DEBIT,
+                  fontSize: 13.5,
+                  fontWeight: 700,
+                  cursor: clearLedgerPreviewCount === 0 ? "not-allowed" : "pointer",
+                }}
+              >
+                <Trash2 size={14} />
+                Clear {clearLedgerPreviewCount > 0 ? `${clearLedgerPreviewCount} ` : ""}transaction{clearLedgerPreviewCount === 1 ? "" : "s"}
+              </button>
+              {clearLedgerPreviewCount === 0 && (
+                <div style={{ fontSize: 11.5, color: MUTED, marginTop: 8 }}>
+                  No transactions found between {fmtDate(clearFromDate)} and {fmtDate(clearThroughDate)} — nothing to clear in this range.
+                </div>
+              )}
             </div>
           </>
         )}
@@ -3172,6 +3662,104 @@ export default function Ledger() {
               </button>
             </div>
             <div style={{ fontSize: 11.5, color: MUTED, marginTop: 10 }}>Undo is available on the Ledger tab if this doesn't look right.</div>
+          </div>
+        </div>
+      )}
+      {chartDrillTarget && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 65 }} onClick={() => setChartDrillTarget(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: SURFACE, width: "100%", maxWidth: 420, borderRadius: "16px 16px 0 0", padding: "1.25rem", boxSizing: "border-box", maxHeight: "75vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: TEXT }}>
+                {fmtDate(chartDrillTarget.date)} · {accountName(chartDrillTarget.accountId)}
+              </div>
+              <button onClick={() => setChartDrillTarget(null)} aria-label="Close" style={{ background: "none", border: "none", color: MUTED, cursor: "pointer", padding: 2, display: "flex", alignItems: "center" }}>
+                <X size={18} />
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 14 }}>
+              {chartDrillTarget.matches.length === 0
+                ? "Nothing logged for this account on this day — the balance carried over unchanged from the day before."
+                : `What moved the balance ${chartDrillTarget.matches.length === 1 ? "here" : "on this day"}.`}
+            </div>
+            {chartDrillTarget.matches.length === 0 ? (
+              chartDrillTarget.nearest ? (
+                <>
+                  <div style={{ fontSize: 11.5, color: GOLD, fontWeight: 700, marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
+                    <ArrowLeft size={12} style={{ transform: chartDrillTarget.nearest.date > chartDrillTarget.date ? "rotate(180deg)" : "none" }} />
+                    Nearest transaction · {fmtDate(chartDrillTarget.nearest.date)}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <LedgerRow
+                      t={chartDrillTarget.nearest}
+                      accountName={accountName}
+                      remove={remove}
+                      onEditSeries={openEditSeries}
+                      onEditOccurrence={editOccurrence}
+                      onCycleStatus={cycleStatus}
+                      accounts={accounts}
+                      balanceAfter={completedBalanceByItemId[chartDrillTarget.nearest.id]}
+                    />
+                  </div>
+                  <button
+                    onClick={() => goToTransactionInLedger(chartDrillTarget.nearest)}
+                    style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, width: "100%", marginTop: 10, background: "none", border: `1px solid ${GOLD}`, borderRadius: 8, padding: "0.55rem", color: GOLD, fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+                  >
+                    <Receipt size={14} />
+                    View in Ledger
+                  </button>
+                </>
+              ) : (
+                <EmptyNote>No transaction to show — this account has no history yet.</EmptyNote>
+              )
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {chartDrillTarget.matches.map((t) => (
+                  <div key={t.id}>
+                    <LedgerRow
+                      t={t}
+                      accountName={accountName}
+                      remove={remove}
+                      onEditSeries={openEditSeries}
+                      onEditOccurrence={editOccurrence}
+                      onCycleStatus={cycleStatus}
+                      accounts={accounts}
+                      balanceAfter={completedBalanceByItemId[t.id]}
+                    />
+                    <button
+                      onClick={() => goToTransactionInLedger(t)}
+                      style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, width: "100%", marginTop: 4, background: "none", border: `1px solid ${GOLD}`, borderRadius: 8, padding: "0.5rem", color: GOLD, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      <Receipt size={13} />
+                      View in Ledger
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {showClearConfirm && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 65 }} onClick={() => setShowClearConfirm(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: SURFACE, width: "100%", maxWidth: 420, borderRadius: "16px 16px 0 0", padding: "1.25rem", boxSizing: "border-box" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: TEXT, marginBottom: 4 }}>Clear {clearLedgerPreviewCount} transaction{clearLedgerPreviewCount === 1 ? "" : "s"}?</div>
+            <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 18 }}>
+              This deletes every income, bill, expense, and transfer entry dated {fmtDate(clearFromDate)} through{" "}
+              {fmtDate(clearThroughDate)}. Anything outside that range is left alone — along with your accounts,
+              recurring templates, and debts.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => setShowClearConfirm(false)}
+                style={{ flex: 1, padding: "0.75rem", borderRadius: 8, border: `1px solid ${LINE}`, background: "none", color: TEXT, fontSize: 14, fontWeight: 700, cursor: "pointer" }}
+              >
+                Cancel
+              </button>
+              <button onClick={clearLedger} style={{ flex: 1, padding: "0.75rem", borderRadius: 8, border: "none", background: DEBIT, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                Clear ledger
+              </button>
+            </div>
+            <div style={{ fontSize: 11.5, color: MUTED, marginTop: 10 }}>Undo is available on the Ledger tab right after, if this doesn't look right.</div>
           </div>
         </div>
       )}
