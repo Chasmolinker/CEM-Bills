@@ -1,0 +1,79 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install esbuild
+        run: npm install esbuild@0.27.7
+
+      - name: Compile ledger.jsx + main.jsx into bundle.js
+        run: |
+          npx esbuild main.jsx \
+            --bundle \
+            --format=esm \
+            --jsx=automatic \
+            --external:react \
+            --external:react-dom \
+            --external:react-dom/client \
+            --external:react/jsx-runtime \
+            --external:recharts \
+            --external:lucide-react \
+            --outfile=bundle.js
+
+      - name: Assemble the deployable site
+        run: |
+          mkdir -p site
+          cp index.html site/
+          cp bundle.js site/
+          cp storage.js site/
+          cp sw.js site/
+          cp manifest.json site/
+          cp icon-192.png site/
+          cp icon-512.png site/
+          cp apple-touch-icon.png site/
+          if [ -f README.md ]; then cp README.md site/; fi
+
+      - name: Stamp the service worker with a unique build ID
+        run: sed -i "s/__BUILD_ID__/${{ github.sha }}-${{ github.run_number }}/" site/sw.js
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

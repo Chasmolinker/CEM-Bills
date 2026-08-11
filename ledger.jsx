@@ -1266,6 +1266,7 @@ export default function Ledger() {
   // instead, so a mid-month overdraft that recovered by month-end doesn't just vanish.
   const chartDisplayDataByAccount = useMemo(() => {
     const result = {};
+    if (!accounts) return result;
     accounts.forEach((a) => {
       if ((balancePeriod !== "quarter" && balancePeriod !== "year") || rollingBalanceData.length === 0) {
         result[a.id] = rollingBalanceData;
