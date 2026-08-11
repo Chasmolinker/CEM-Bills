@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Money Ledger</title>
+
+<!-- PWA / installability -->
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#0B120E" />
+<meta name="background-color" content="#121A16" />
+<meta name="mobile-web-app-capable" content="yes" />
+
+<!-- iOS "Add to Home Screen" support -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Ledger" />
+<meta name="format-detection" content="telephone=no" />
+<link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+<link rel="icon" href="./icon-192.png" />
+
+<!-- iOS splash screen: uses the icon on the app's own background color while it boots -->
+<link rel="apple-touch-startup-image" href="./apple-touch-icon.png" />
+
+
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #121A16;
+    color: #ECF0E7;
+    overscroll-behavior-y: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #root {
+    min-height: 100vh;
+  }
+  #boot-loading {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #8FA093;
+    font-size: 14px;
+    background: #121A16;
+  }
+  #boot-error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    padding: 1.5rem;
+    box-sizing: border-box;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #ECF0E7;
+    background: #121A16;
+    white-space: pre-wrap;
+    overflow: auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+</style>
+
+<!-- Import map: pins every bare-specifier import in ledger.jsx to a real ESM build,
+     with matching React versions across all three so hooks don't break. -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "recharts": "https://esm.sh/recharts@2.12.7?deps=react@18.3.1,react-dom@18.3.1",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1"
+  }
+}
+</script>
+
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+</head>
+<body>
+
+<div id="boot-loading">Loading your ledger…</div>
+<div id="boot-error"></div>
+<div id="root"></div>
+
+<script src="./storage.js"></script>
+
+<script>
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("boot-error");
+    var loading = document.getElementById("boot-loading");
+    if (loading) loading.style.display = "none";
+    if (box) {
+      box.style.display = "block";
+      box.textContent = "Something went wrong loading the app:\n\n" + (e.error && e.error.stack ? e.error.stack : e.message);
+    }
+  });
+</script>
+
+<script type="text/babel" data-type="module" data-presets="react" src="./main.jsx"></script>
+
+<script>
+  // Register the service worker for offline support once the page has loaded.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("./sw.js").catch(function () {});
+    });
+  }
+  // Hide the loading indicator once React has actually painted something into #root.
+  var rootEl = document.getElementById("root");
+  var loadingEl = document.getElementById("boot-loading");
+  var observer = new MutationObserver(function () {
+    if (rootEl.childNodes.length > 0 && loadingEl) {
+      loadingEl.style.display = "none";
+      observer.disconnect();
+    }
+  });
+  observer.observe(rootEl, { childList: true });
+</script>
+
+</body>
+</html>
