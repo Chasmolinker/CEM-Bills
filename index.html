@@ -89,15 +89,53 @@
 <script src="./storage.js"></script>
 
 <script>
-  window.addEventListener("error", function (e) {
+  function showBootError(text) {
     var box = document.getElementById("boot-error");
     var loading = document.getElementById("boot-loading");
     if (loading) loading.style.display = "none";
     if (box) {
       box.style.display = "block";
-      box.textContent = "Something went wrong loading the app:\n\n" + (e.error && e.error.stack ? e.error.stack : e.message);
+      box.textContent = text;
     }
+  }
+
+  window.addEventListener("error", function (e) {
+    showBootError("Something went wrong loading the app:\n\n" + (e.error && e.error.stack ? e.error.stack : e.message || "(no details given)"));
   });
+  window.addEventListener("unhandledrejection", function (e) {
+    var reason = e.reason;
+    showBootError("Something went wrong loading the app:\n\n" + (reason && reason.stack ? reason.stack : String(reason)));
+  });
+
+  // If nothing has rendered after a few seconds, actively check whether the app's
+  // own files are even reachable — a renamed or missing file fails silently here
+  // rather than throwing a normal JS error.
+  setTimeout(function () {
+    var rootEl = document.getElementById("root");
+    if (rootEl && rootEl.childNodes.length > 0) return; // already loaded fine
+    if (document.getElementById("boot-error").style.display === "block") return; // already showing a real error
+
+    Promise.all(
+      ["./ledger.jsx", "./main.jsx", "./storage.js"].map(function (path) {
+        return fetch(path, { cache: "no-store" })
+          .then(function (res) {
+            return path + " → HTTP " + res.status + (res.ok ? " OK" : " — NOT FOUND OR BLOCKED");
+          })
+          .catch(function (err) {
+            return path + " → failed to fetch (" + err.message + ")";
+          });
+      })
+    ).then(function (results) {
+      showBootError(
+        "The app is taking too long to load, which usually means one of its files " +
+        "wasn't found at the expected name (a common issue after saving .jsx files on iPhone).\n\n" +
+        "File check:\n" + results.join("\n") +
+        "\n\nIf any line above doesn't say \"200 OK\", that file's name in your GitHub repo " +
+        "doesn't exactly match what's expected — check for a renamed extension (like .jsx.txt) " +
+        "or different capitalization."
+      );
+    });
+  }, 6000);
 </script>
 
 <script type="text/babel" data-type="module" data-presets="react" src="./main.jsx"></script>

@@ -1,4 +1,4 @@
-const CACHE_NAME = "money-ledger-v2";
+const CACHE_NAME = "money-ledger-v3";
 
 // Core app-shell files, cached immediately on install.
 const APP_SHELL = [
